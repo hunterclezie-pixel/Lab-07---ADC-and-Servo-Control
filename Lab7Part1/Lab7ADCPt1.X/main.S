@@ -110,5 +110,5 @@ WaitADC:
     BANKSEL PORTB
     MOVWF PORTB
     GOTO Main
-
+    
 END
