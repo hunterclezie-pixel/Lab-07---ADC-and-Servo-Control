@@ -1,6 +1,6 @@
 // Hunter Clezie
 // RCET3375
-// Lab7ADCPt2
+// Lab7ADCPt3
 // https://github.com/hunterclezie-pixel/Lab-07---ADC-and-Servo-Control.git
 
 ; PIC16F883 Configuration Bit Settings
@@ -26,13 +26,24 @@
 ; config statements should precede project file includes.
 #include <xc.inc>  
     ; General Purpose Registers
+    ccp_next_l EQU 0x23     ; Low byte of next CCP compare value
+    ccp_next_h EQU 0x24     ; High byte of next CCP compare value
+    ; Address 0x25 is used by the supplied lookup file
+    ; Do not use 0x25 in this program
+    
     adc_low EQU 0x70	    ; Stores lower 8 bits of ADC result
     adc_high EQU 0x71	    ; Stores upper 2 bits of ADC result
     map_temp EQU 0x72	    ; Temporary value used for ADC mapping
     servo_index EQU 0x73    ; Servo position from 0 through 20
     servo_count EQU 0x74    ; Counts additional 100 us delays
     delay_count EQU 0x75    ; Counter used inside delay loops
-    adc_temp EQU 0x76
+    W_TEMP EQU 0x76         ; Saves W during interrupt
+    STATUS_TEMP EQU 0x77    ; Saves STATUS during interrupt
+    PCLATH_TEMP EQU 0x78    ; Saves PCLATH during interrupt
+ 
+    ; Lookup routine is located inside Lab07-Part3-Lookup.S
+    GLOBAL ccp_next_l, ccp_next_h
+    EXTRN LookupAdc6ToCcp
  
 ; Reset Vector at 0000h. Execution starts here after reset.
 PSECT resetVect,class=CODE,delta=2
@@ -42,6 +53,7 @@ ResetVector:
 ; Interrupt Vector
 PSECT isrVect,class=CODE,delta=2
 InterruptVector:
+    Goto ISRHandler
 
 ; Main code section starts at 0008h. User code goes here.
 PSECT code,class=CODE,delta=2
@@ -87,9 +99,49 @@ Setup:
     MOVWF TMR1L     ; Timer1 preload low byte
     BCF PIR1,0      ; Clear Timer1 overflow flag
     BSF T1CON,0     ; Start Timer1
-    CLRF servo_index
-    CLRF servo_count
-    CLRF delay_count
+
+    ; CCP1 Setup
+    BANKSEL CCP1CON
+    MOVLW 0x0A
+    MOVWF CCP1CON   ; CCP1 Compare mode, software interrupt on match
+
+    ; Initial Servo Command
+    BANKSEL ccp_next_l
+    MOVLW 0xD4
+    MOVWF ccp_next_l ; Low byte of 0xB3D4
+    MOVLW 0xB3
+    MOVWF ccp_next_h ; High byte of 0xB3D4
+
+    ; Also load the first value into the actual CCP registers.
+    BANKSEL CCPR1L
+    MOVLW 0xD4
+    MOVWF CCPR1L
+    MOVLW 0xB3
+    MOVWF CCPR1H
+
+    ; Clear Program Flags
+    BANKSEL pulse_busy
+    CLRF pulse_busy ; Servo pulse is not active yet
+    CLRF command_ready ; ADC command has not been calculated yet
+
+    ; Clear Interrupt Flags
+    BANKSEL PIR1
+    BCF PIR1,0    ; Clear TMR1IF
+    BCF PIR1,2    ; Clear CCP1IF
+
+    ; Enable Timer1 and CCP1 Interrupts
+    BANKSEL PIE1
+    BSF PIE1,0    ; TMR1IE = 1, enable Timer1 interrupt
+    BSF PIE1,2    ; CCP1IE = 1, enable CCP1 interrupt
+
+    ; Start Timer1
+    BANKSEL T1CON
+    BSF T1CON,0   ; TMR1ON = 1
+
+    ; Enable Peripheral and Global Interrupts
+    BANKSEL INTCON
+    BSF INTCON,6  ; PEIE = 1, enable peripheral interrupts
+    BSF INTCON,7  ; GIE = 1, enable global interrupts
 
 GOTO Main    
 
@@ -155,6 +207,7 @@ WaitADC:
     RETURN
     
 MapADC:
+    ; Move ADC bits 9 and 8 into bits 5 and 4.
     BANKSEL adc_high
     MOVF adc_high,W
     MOVWF map_temp
@@ -164,106 +217,116 @@ MapADC:
     RLF map_temp,F
     BCF STATUS,0
     RLF map_temp,F
+    BCF STATUS,0
+    
+    ; Move ADC bits 7 through 4 into bits 3 through 0.
     MOVF adc_low,W
-    MOVWF servo_index      ; Temporary storage
+    MOVWF adc_temp
+    BCF STATUS,0            ; Clear Carry before shifting
+    RRF adc_temp,F
     BCF STATUS,0
-    RRF servo_index,F
+    RRF adc_temp,F
     BCF STATUS,0
-    RRF servo_index,F
+    RRF adc_temp,F
     BCF STATUS,0
-    RRF servo_index,F
-    BCF STATUS,0
-    RRF servo_index,F
-    BCF STATUS,0
-    RRF servo_index,F
-
-    ; Combine the upper 2 bits and lower 3 bits
+    RRF adc_temp,F
+    
+    ; Combine both sections to create a 6-bit value
     MOVF servo_index,W
     IORWF map_temp,F
 
     ; Send the 0-31 value to the lookup table
+    ; Send 6-bit command from 0-63 to supplied lookup table.
     MOVF map_temp,W
-    CALL ServoLookup
-    MOVWF servo_index	; Save returned servo position
+    PAGESEL LookupAdc6ToCcp
+    CALL LookupAdc6ToCcp
+    PAGESEL $
     RETURN
 
-ServoLookup:
-    ADDWF PCL,F	    ; Jump forward in table using W
-    RETLW 0	    ; ADC group 0 - Min
-    RETLW 0	    ; ADC group 1
-    RETLW 1	    ; ADC group 2
-    RETLW 1	    ; ADC group 3
-    RETLW 2	    ; ADC group 4
-    RETLW 3	    ; ADC group 5
-    RETLW 3	    ; ADC group 6
-    RETLW 4	    ; ADC group 7
-    RETLW 5	    ; ADC group 8
-    RETLW 5	    ; ADC group 9
-    RETLW 6	    ; ADC group 10
-    RETLW 7	    ; ADC group 11
-    RETLW 7	    ; ADC group 12
-    RETLW 8	    ; ADC group 13
-    RETLW 9	    ; ADC group 14
-    RETLW 9	    ; ADC group 15
-    RETLW 10	    ; ADC group 16 - Center
-    RETLW 11	    ; ADC group 17
-    RETLW 11	    ; ADC group 18
-    RETLW 12	    ; ADC group 19
-    RETLW 13	    ; ADC group 20
-    RETLW 13	    ; ADC group 21
-    RETLW 14	    ; ADC group 22
-    RETLW 15	    ; ADC group 23
-    RETLW 15	    ; ADC group 24
-    RETLW 16	    ; ADC group 25
-    RETLW 17	    ; ADC group 26
-    RETLW 17	    ; ADC group 27
-    RETLW 18	    ; ADC group 28
-    RETLW 19	    ; ADC group 29
-    RETLW 19	    ; ADC group 30
-    RETLW 20	    ; ADC group 31 - Maximum
+ISRHandler:
+    ; Save W and STATUS before changing anything in interrupt
+    MOVWF W_TEMP
+    SWAPF STATUS,W
+    MOVWF STATUS_TEMP
 
-ServoPulse:
+    ; Check Timer1 overflow interrupt first.
+    BANKSEL PIR1
+    BTFSC PIR1,0      ; Did Timer1 overflow?
+    GOTO Timer1ISR
+
+    ; Check CCP1 compare interrupt.
+    BTFSC PIR1,2      ; Did Timer1 match CCPR1?
+    GOTO CCP1ISR
+    GOTO ISRDone
+
+Timer1ISR:
+    ; Timer1 overflow marks the beginning of a new 20 ms frame.
+    BANKSEL PIR1
+    BCF PIR1,0       ; Clear Timer1 interrupt flag
+
+    ; Reload Timer1 with 0xB1E0 for another 20 ms frame.
+    BANKSEL TMR1H
+    MOVLW 0xB1
+    MOVWF TMR1H
+    MOVLW 0xE0
+    MOVWF TMR1L
+
+    ; Start servo pulse HIGH.
     BANKSEL PORTA
-    BSF PORTA,1      ; Start servo pulse HIGH
-    CALL Delay500us  ; Every servo position gets at least 500 us HIGH
+    BSF PORTA,1     ; Servo signal HIGH
 
-    ; Copy servo index into a counter.
-    BANKSEL servo_index
-    MOVF servo_index,W
-    MOVWF servo_count
+    ; Load the saved CCP low byte.
+    BANKSEL ccp_next_l
+    MOVF ccp_next_l,W
+    BANKSEL CCPR1L
+    MOVWF CCPR1L
 
-    ; Check for position 0
-    MOVF servo_count,F
-    BTFSC STATUS,2         ; Is servo_count zero?
-    GOTO ServoDone         ; Yes -> pulse is only 500 us
+    ; Load the saved CCP high byte.
+    BANKSEL ccp_next_h
+    MOVF ccp_next_h,W
+    BANKSEL CCPR1H
+    MOVWF CCPR1H
 
-Extra100us:
-    CALL Delay100us        ; Add approximately 100 us
-    DECFSZ servo_count,F   ; Decrease count by one
-    GOTO Extra100us        ; More delays needed? No -> pulse is finished
-			   
-ServoDone:
+    ; Clear any old CCP interrupt flag before enabling it.
+    BANKSEL PIR1
+    BCF PIR1,2     ; Clear CCP1IF
+
+    ; Mark servo pulse as active.
+    BANKSEL pulse_busy
+    MOVLW 0x01
+    MOVWF pulse_busy
+
+    ; Enable CCP1 interrupt for this servo pulse.
+    BANKSEL PIE1
+    BSF PIE1,2     ; CCP1IE = 1
+    GOTO ISRDone
+
+CCP1ISR:
+    ; Compare value from the supplied lookup table.
+    BANKSEL PIR1
+    BCF PIR1,2     ; Clear CCP1 interrupt flag
+
+    ; End the servo pulse.
     BANKSEL PORTA
-    BCF PORTA,1            ; End servo pulse, output LOW
-    RETURN
+    BCF PORTA,1    ; Servo signal LOW
 
-Delay100us:
-    MOVLW 0x17
-    MOVWF delay_count
+    ; Disable CCP interrupt until the next servo pulse.
+    BANKSEL PIE1
+    BCF PIE1,2     ; CCP1IE = 0
 
-Delay100Loop:
-    NOP                    ; Small timing delay
-    DECFSZ delay_count,F   ; Count down toward zero
-    GOTO Delay100Loop
-    RETURN
+    ; Mark servo pulse as finished.
+    BANKSEL pulse_busy
+    CLRF pulse_busy
+    GOTO ISRDone
 
-Delay500us:
-    MOVLW 0xA5
-    MOVWF delay_count
+ISRDone:
+    ; Restore STATUS register.
+    SWAPF STATUS_TEMP,W
+    MOVWF STATUS
 
-Delay500Loop:
-    DECFSZ delay_count,F   ; Count down toward zero
-    GOTO Delay500Loop
-    RETURN
+    ; Restore W register.
+    SWAPF W_TEMP,F
+    SWAPF W_TEMP,W
+    RETFIE
 
 END
