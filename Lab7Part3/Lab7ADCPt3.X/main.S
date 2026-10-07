@@ -33,13 +33,11 @@
     
     adc_low EQU 0x70	    ; Stores lower 8 bits of ADC result
     adc_high EQU 0x71	    ; Stores upper 2 bits of ADC result
-    map_temp EQU 0x72	    ; Temporary value used for ADC mapping
-    servo_index EQU 0x73    ; Servo position from 0 through 20
-    servo_count EQU 0x74    ; Counts additional 100 us delays
-    delay_count EQU 0x75    ; Counter used inside delay loops
-    W_TEMP EQU 0x76         ; Saves W during interrupt
+    adc_index EQU 0x72      ; Stores 6-bit ADC index from 0-63
+    pulse_busy EQU 0x74     ; 1 = servo pulse active, 0 = pulse finished
+    W_TEMP EQU 0x75         ; Temporary storage for W during interrupt
+    adc_done EQU 0x76       ; 1 = next ADC command ready, 0 = new command needed
     STATUS_TEMP EQU 0x77    ; Saves STATUS during interrupt
-    PCLATH_TEMP EQU 0x78    ; Saves PCLATH during interrupt
  
     ; Lookup routine is located inside Lab07-Part3-Lookup.S
     GLOBAL ccp_next_l, ccp_next_h
@@ -68,11 +66,11 @@ Setup:
     BCF 0x03,6      ; Sets Bank 1
     BSF 0x03,5      ; Sets Bank 1
     MOVLW 0x01
-    MOVWF 0x85      ; TRISA: RA0 = input, RA1 = servo output
+    MOVWF 0x85      ; TRISA: RA0 = input
     CLRF 0x86       ; TRISB: PORTB outputs
-    CLRF 0x87       ; TRISC: PORTC outputs
+    CLRF 0x87       ; TRISC: RC2 = servo output
     CLRF ADCON1     ; Clear ADCON1
-    BSF ADCON1,7    ; ADFM = 1, right justify result
+    BCF ADCON1,7    ; ADFM = 0, left justify result
     BCF ADCON1,5    ; VREF- = VSS
     BCF ADCON1,4    ; VREF+ = VDD
 
@@ -90,40 +88,26 @@ Setup:
     BSF ADCON0,6    ; ADCS0 = 1                         
     ; Selects AN0 as ADC input
     BSF ADCON0,0    ; ADON = 1, turn ADC on
-    
-    ; Timer1 Setup
-    CLRF T1CON      ; Timer1 off while configuring
-    MOVLW 0xB1
-    MOVWF TMR1H     ; Timer1 preload high byte
-    MOVLW 0xE0
-    MOVWF TMR1L     ; Timer1 preload low byte
-    BCF PIR1,0      ; Clear Timer1 overflow flag
-    BSF T1CON,0     ; Start Timer1
 
     ; CCP1 Setup
     BANKSEL CCP1CON
     MOVLW 0x0A
     MOVWF CCP1CON   ; CCP1 Compare mode, software interrupt on match
 
-    ; Initial Servo Command
-    BANKSEL ccp_next_l
-    MOVLW 0xD4
-    MOVWF ccp_next_l ; Low byte of 0xB3D4
-    MOVLW 0xB3
-    MOVWF ccp_next_h ; High byte of 0xB3D4
-
-    ; Also load the first value into the actual CCP registers.
-    BANKSEL CCPR1L
-    MOVLW 0xD4
-    MOVWF CCPR1L
-    MOVLW 0xB3
-    MOVWF CCPR1H
-
     ; Clear Program Flags
-    BANKSEL pulse_busy
-    CLRF pulse_busy ; Servo pulse is not active yet
-    CLRF command_ready ; ADC command has not been calculated yet
+    CLRF adc_low
+    CLRF adc_high
+    CLRF adc_index
+    CLRF pulse_busy
+    CLRF adc_done
 
+    ; Prepare first ADC command before Timer1 starts
+    CALL ReadADC
+    CALL MapADC
+    BANKSEL adc_done
+    MOVLW 0x01
+    MOVWF adc_done
+    
     ; Clear Interrupt Flags
     BANKSEL PIR1
     BCF PIR1,0    ; Clear TMR1IF
@@ -133,11 +117,17 @@ Setup:
     BANKSEL PIE1
     BSF PIE1,0    ; TMR1IE = 1, enable Timer1 interrupt
     BSF PIE1,2    ; CCP1IE = 1, enable CCP1 interrupt
-
-    ; Start Timer1
+    
+    ; Timer1 Setup
     BANKSEL T1CON
-    BSF T1CON,0   ; TMR1ON = 1
-
+    CLRF T1CON      ; Timer1 off while configuring
+    MOVLW 0xB1
+    MOVWF TMR1H     ; Timer1 preload high byte
+    MOVLW 0xE0
+    MOVWF TMR1L     ; Timer1 preload low byte
+    BCF PIR1,0      ; Clear Timer1 overflow flag
+    BSF T1CON,0     ; Start Timer1
+    
     ; Enable Peripheral and Global Interrupts
     BANKSEL INTCON
     BSF INTCON,6  ; PEIE = 1, enable peripheral interrupts
@@ -146,24 +136,32 @@ Setup:
 GOTO Main    
 
 Main:
-    CALL WaitFrame  ; Wait for Timer1 20 ms frame
-    CALL ReadADC    ; Read potentiometer voltage
-    CALL MapADC     ; Convert ADC into servo position
-    CALL ServoPulse ; Generate servo HIGH pulse
-    GOTO Main       ; Repeat continuously
+    ; Do not acquire ADC while servo pulse is active
+    BANKSEL pulse_busy
+    MOVF pulse_busy,F
+    BTFSS STATUS,2
+    GOTO Main
 
-WaitFrame:
-    ; Wait for next 20 ms frame
-    BTFSS PIR1,0    ; Has Timer1 overflowed?
-    GOTO WaitFrame
-    BCF PIR1,0      ; Clear Timer1 flag
+    ; Do not acquire another ADC value if next command is ready
+    BANKSEL adc_done
+    MOVF adc_done,F
+    BTFSS STATUS,2
+    GOTO Main
 
-    ; Reload Timer1 for another 20 ms
-    MOVLW 0xB1
-    MOVWF TMR1H
-    MOVLW 0xE0
-    MOVWF TMR1L
-    RETURN
+    ; Acquire one command for the next frame
+    CALL ReadADC
+    CALL MapADC
+
+    ; Mark next command as ready
+    BANKSEL adc_done
+    MOVLW 0x01
+    MOVWF adc_done
+    
+    ; Display ADC on LEDs
+    MOVF adc_low,W
+    BANKSEL PORTB
+    MOVWF PORTB
+    Goto Main
    
 ReadADC:
     ; Acquisition Delay that allows sample/hold capacitor to charge
@@ -193,51 +191,27 @@ WaitADC:
     MOVF ADRESL,W
     BANKSEL adc_low
     MOVWF adc_low
-    
-    ; Display ADC on LEDs
-    MOVF adc_low,W
-    BANKSEL PORTB
-    MOVWF PORTB
-
-    BANKSEL adc_high
-    MOVF adc_high,W
-    BANKSEL PORTC
-    MOVWF PORTC
-
     RETURN
     
 MapADC:
-    ; Move ADC bits 9 and 8 into bits 5 and 4.
+    ; Shift ADRESH right twice to create a 6-bit index
     BANKSEL adc_high
     MOVF adc_high,W
-    MOVWF map_temp
-    BCF STATUS,0           ; Clear Carry before shifting
-    RLF map_temp,F
-    BCF STATUS,0
-    RLF map_temp,F
-    BCF STATUS,0
-    RLF map_temp,F
-    BCF STATUS,0
-    
-    ; Move ADC bits 7 through 4 into bits 3 through 0.
-    MOVF adc_low,W
-    MOVWF adc_temp
-    BCF STATUS,0            ; Clear Carry before shifting
-    RRF adc_temp,F
-    BCF STATUS,0
-    RRF adc_temp,F
-    BCF STATUS,0
-    RRF adc_temp,F
-    BCF STATUS,0
-    RRF adc_temp,F
-    
-    ; Combine both sections to create a 6-bit value
-    MOVF servo_index,W
-    IORWF map_temp,F
+    BANKSEL adc_index
+    MOVWF adc_index
 
-    ; Send the 0-31 value to the lookup table
-    ; Send 6-bit command from 0-63 to supplied lookup table.
-    MOVF map_temp,W
+    ; Shift right once
+    BCF STATUS,0
+    RRF adc_index,F
+
+    ; Shift right a second time
+    BCF STATUS,0
+    RRF adc_index,F
+
+    ; adc_index now contains a value from 0-63
+    MOVF adc_index,W
+
+    ; Send 6-bit command to supplied lookup routine
     PAGESEL LookupAdc6ToCcp
     CALL LookupAdc6ToCcp
     PAGESEL $
@@ -272,8 +246,8 @@ Timer1ISR:
     MOVWF TMR1L
 
     ; Start servo pulse HIGH.
-    BANKSEL PORTA
-    BSF PORTA,1     ; Servo signal HIGH
+    BANKSEL PORTC
+    BSF PORTC,2
 
     ; Load the saved CCP low byte.
     BANKSEL ccp_next_l
@@ -286,6 +260,10 @@ Timer1ISR:
     MOVF ccp_next_h,W
     BANKSEL CCPR1H
     MOVWF CCPR1H
+    
+    ; Allow one new ADC command for the next frame
+    BANKSEL adc_done
+    CLRF adc_done
 
     ; Clear any old CCP interrupt flag before enabling it.
     BANKSEL PIR1
@@ -307,8 +285,8 @@ CCP1ISR:
     BCF PIR1,2     ; Clear CCP1 interrupt flag
 
     ; End the servo pulse.
-    BANKSEL PORTA
-    BCF PORTA,1    ; Servo signal LOW
+    BANKSEL PORTC
+    BCF PORTC,2    ; Servo signal LOW
 
     ; Disable CCP interrupt until the next servo pulse.
     BANKSEL PIE1
@@ -320,11 +298,9 @@ CCP1ISR:
     GOTO ISRDone
 
 ISRDone:
-    ; Restore STATUS register.
+    ; Restore STATUS and W register
     SWAPF STATUS_TEMP,W
     MOVWF STATUS
-
-    ; Restore W register.
     SWAPF W_TEMP,F
     SWAPF W_TEMP,W
     RETFIE
