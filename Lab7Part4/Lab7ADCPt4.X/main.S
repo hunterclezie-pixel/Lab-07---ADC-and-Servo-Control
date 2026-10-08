@@ -1,6 +1,6 @@
 // Hunter Clezie
 // RCET3375
-// Lab7ADCPt3
+// Lab7ADCPt4
 // https://github.com/hunterclezie-pixel/Lab-07---ADC-and-Servo-Control.git
 
 ; PIC16F883 Configuration Bit Settings
@@ -26,22 +26,21 @@
 ; config statements should precede project file includes.
 #include <xc.inc>  
     ; General Purpose Registers
-    ccp_next_l EQU 0x23     ; Low byte of next CCP compare value
-    ccp_next_h EQU 0x24     ; High byte of next CCP compare value
-    ; Address 0x25 is used by the supplied lookup file
+    ccp_next_l EQU 0x21     ; Low byte of next CCP compare value
+    ccp_next_h EQU 0x22     ; High byte of next CCP compare value
+    adc_l EQU 0x23          ; Lower 8 bits of ADC result
+    adc_h EQU 0x24          ; Upper 2 bits of ADC result
+    ; Address 0x25 is used by supplied Part 4 mapping file
     ; Do not use 0x25 in this program
-    
-    adc_low EQU 0x70	    ; Stores lower 8 bits of ADC result
-    adc_high EQU 0x71	    ; Stores upper 2 bits of ADC result
-    adc_index EQU 0x72      ; Stores 6-bit ADC index from 0-63
+
     pulse_busy EQU 0x74     ; 1 = servo pulse active, 0 = pulse finished
     W_TEMP EQU 0x75         ; Temporary storage for W during interrupt
     adc_done EQU 0x76       ; 1 = next ADC command ready, 0 = new command needed
     STATUS_TEMP EQU 0x77    ; Saves STATUS during interrupt
  
-    ; Lookup routine is located inside Lab07-Part3-Lookup.S
-    GLOBAL ccp_next_l, ccp_next_h
-    EXTRN LookupAdc6ToCcp
+    ; Supplied Part 4 mapping routine
+    GLOBAL ccp_next_l, ccp_next_h, adc_l, adc_h
+    EXTRN MapAdcToCcp
  
 ; Reset Vector at 0000h. Execution starts here after reset.
 PSECT resetVect,class=CODE,delta=2
@@ -70,7 +69,7 @@ Setup:
     CLRF 0x86       ; TRISB: PORTB outputs
     CLRF 0x87       ; TRISC: RC2 = servo output
     CLRF ADCON1     ; Clear ADCON1
-    BCF ADCON1,7    ; ADFM = 0, left justify result
+    BSF ADCON1,7    ; ADFM = 1, right justify result
     BCF ADCON1,5    ; VREF- = VSS
     BCF ADCON1,4    ; VREF+ = VDD
 
@@ -95,9 +94,10 @@ Setup:
     MOVWF CCP1CON   ; CCP1 Compare mode, software interrupt on match
 
     ; Clear Program Flags
-    CLRF adc_low
-    CLRF adc_high
-    CLRF adc_index
+    CLRF adc_l
+    CLRF adc_h
+    CLRF ccp_next_l
+    CLRF ccp_next_h
     CLRF pulse_busy
     CLRF adc_done
 
@@ -156,11 +156,6 @@ Main:
     BANKSEL adc_done
     MOVLW 0x01
     MOVWF adc_done
-    
-    ; Display ADC on LEDs
-    MOVF adc_low,W
-    BANKSEL PORTB
-    MOVWF PORTB
     Goto Main
    
 ReadADC:
@@ -183,37 +178,20 @@ WaitADC:
     ; Save upper 2 ADC bits
     BANKSEL ADRESH
     MOVF ADRESH,W
-    BANKSEL adc_high
-    MOVWF adc_high
+    BANKSEL adc_h
+    MOVWF adc_h
     
     ; Save lower 8 ADC bits
     BANKSEL ADRESL
     MOVF ADRESL,W
-    BANKSEL adc_low
-    MOVWF adc_low
+    BANKSEL adc_l
+    MOVWF adc_l
     RETURN
     
 MapADC:
-    ; Shift ADRESH right twice to create a 6-bit index
-    BANKSEL adc_high
-    MOVF adc_high,W
-    BANKSEL adc_index
-    MOVWF adc_index
-
-    ; Shift right once
-    BCF STATUS,0
-    RRF adc_index,F
-
-    ; Shift right a second time
-    BCF STATUS,0
-    RRF adc_index,F
-
-    ; adc_index now contains a value from 0-63
-    MOVF adc_index,W
-
-    ; Send 6-bit command to supplied lookup routine
-    PAGESEL LookupAdc6ToCcp
-    CALL LookupAdc6ToCcp
+    ; Use full 10-bit ADC result to calculate CCP match
+    PAGESEL MapAdcToCcp
+    CALL MapAdcToCcp
     PAGESEL $
     RETURN
 
